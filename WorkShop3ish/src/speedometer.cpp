@@ -64,11 +64,15 @@ float a_x, a_y, a_z;
 float a_f, g_f;
 
 //############## PID PARAMETERS #####################
-double v_D = 0.0; // desired vehicle speed [m/s]
+double v_desired = 0.15; // desired vehicle speed [m/s]
 double omega_D = 0.0; // desired vehicle turn rate [rad/s]
-double v_L = 0.0; // desired left wheel speed [m/s]
-double v_R = 0.0; // desired right wheel speed [m/s]
-
+double v_L_desired = 0.0; // desired left wheel speed [m/s]
+double v_R_desired = 0.0; // desired right wheel speed [m/s]
+const double K_P = 100.0; // Proportional gain for speed controller
+double error_L = 0.0; // speed error left wheel [m/s]
+double error_R = 0.0; // speed error right wheel [m/s]
+int L_output = 0; // Left wheel controller output [0-255]
+int R_output = 0; // Right wheel controller output [0-255]
 
 // This function is called when SIGNAL_A goes HIGH
 void decodeEncoderTicks()
@@ -104,7 +108,7 @@ double compute_vehicle_speed(double translational_speed_L, double translational_
 }
 
 //compute vehicle turn rate [rad/s]
-double compute_vehicle_rate(double translational_speed_L, double translational_speed_R){
+double comput_vehicle_encoder_turn_rate(double translational_speed_L, double translational_speed_R){
     double omega;
     omega = 1.0 / ELL * (translational_speed_R - translational_speed_L);
     return omega;
@@ -113,7 +117,7 @@ double compute_vehicle_rate(double translational_speed_L, double translational_s
 double yawRate(const float alpha, const double translational_speed_L, const double translational_speed_R){
     // YawRate = a * Gyro + (1-a) * encoder
     float gyro = (omega_z - z_bias) * PI / 180.0; // Convert to rad/s
-    float encoder = compute_vehicle_rate(translational_speed_L, translational_speed_R);
+    float encoder = comput_vehicle_encoder_turn_rate(translational_speed_L, translational_speed_R);
     if (abs(encoder) < 0.06) {
         encoder = 0.0;
     }   
@@ -121,9 +125,9 @@ double yawRate(const float alpha, const double translational_speed_L, const doub
 }
 
 //Activity 1 Workshop 3: compute desired wheel parameters
-void compute_desired_wheel_parameters(double v_D, double omega_D, double& v_L, double& v_R){
-    v_L = v_D - (0.5 * ELL * omega_D); //
-    v_R = v_D + (0.5 * ELL * omega_D); //
+void compute_desired_wheel_parameters(double v_desired, double omega_D, double& v_L_desired, double& v_R_desired){
+    v_L_desired = v_desired - (0.5 * ELL * omega_D); //
+    v_R_desired = v_desired + (0.5 * ELL * omega_D); //
 }
 
 //Activity 2 Workshop 3: compute desired wheel PWM commands
@@ -133,12 +137,9 @@ int controller_P_only(double error, double K_P){
     //saturate U to be between 0 and 255
     if (U > 255){
         U = 255;
-        
-        // i3, i4 are 0,1
-        // i1, i2 are 1,0
     }
-    else if (U < 0){
-        U = abs(U);
+    else if (U < -255){
+        U = -255;
     }
     return U;
 }
@@ -240,8 +241,19 @@ void loop()
         translational_speed_R = omega_R * RHO;
 
         v = compute_vehicle_speed(translational_speed_L, translational_speed_R);
-        omega = compute_vehicle_rate(translational_speed_L, translational_speed_R);
+        omega = comput_vehicle_encoder_turn_rate(translational_speed_L, translational_speed_R);
         
+        //################ NEW PID STUFF #####################
+        compute_desired_wheel_parameters(v_desired, omega_D, v_L_desired, v_R_desired);
+        error_L = v_L_desired - translational_speed_L;
+        error_R = v_R_desired - translational_speed_R;
+
+        //----------P Controller----------------
+        L_output = controller_P_only(error_L, K_P);
+        R_output = controller_P_only(error_R, K_P);
+
+        //Print Yaw related information
+        /*
         Serial.println("Yaw Rate:");
         Serial.print("Combined Yaw Rate:");
         Serial.print(yawRate(0.98, translational_speed_L, translational_speed_R));
@@ -250,10 +262,37 @@ void loop()
         Serial.print(omega_z - z_bias);
         Serial.print(" rad/s\n");
         Serial.print("Encoder Only Yaw Rate:");
-        Serial.print(compute_vehicle_rate(translational_speed_L, translational_speed_R));
+        Serial.print(comput_vehicle_encoder_turn_rate(translational_speed_L, translational_speed_R));
         Serial.print(" rad/s");
         Serial.print("\n");
+        */
         
+        //Print Speed Control loop information
+        Serial.print("Desired Left Wheel Speed (m/s): ");
+        Serial.print(v_L_desired);
+        Serial.print("Actual Left Wheel Speed (m/s): ");
+        Serial.println(translational_speed_L);
+        Serial.print("\t");
+        Serial.print("Error L: ");
+        Serial.print(error_L);
+        Serial.print("\n");
+        Serial.print("Raw Out L: ");
+        Serial.print(L_output);
+        Serial.print("\n");
+
+
+        Serial.print("Desired Right Wheel Speed (m/s): ");
+        Serial.print(v_R_desired);
+        Serial.print("Actual Right Wheel Speed (m/s): ");
+        Serial.println(translational_speed_R);
+        Serial.print("\t");
+        Serial.print("Error R: ");  
+        Serial.println(error_R);
+        Serial.print("Raw Out R: ");
+        Serial.print(R_output);
+        Serial.print("\n-----------------------\n"); 
+        
+
         // Record the current time [ms]
         t_last = t_now;
 
@@ -262,19 +301,29 @@ void loop()
         right_encoder_ticks = 0;
     }
 
-    // Set the wheel motor PWM command [0-255]
-    U_R = 128;
-    U_L = 128;
+    if(R_output >=0){
+        // Select a direction, RIGHT wheels
+        //Forward
+        digitalWrite(I3, LOW);
+        digitalWrite(I4, HIGH);
+    }
+    else{
+        // Select a direction, RIGHT wheels
+        //Reverse
+        digitalWrite(I3, HIGH);
+        digitalWrite(I4, LOW);
+    }
+    analogWrite(EB, abs(R_output));
 
-    // Select a direction, RIGHT wheels
-    digitalWrite(I1, HIGH);
-    digitalWrite(I2, LOW);
-
-    //LEFT wheels
-    digitalWrite(I3, LOW);
-    digitalWrite(I4, HIGH);
-
-    // PWM command to the motor driver
-    analogWrite(EA, U_L);
-    analogWrite(EB, U_R);
+    if(L_output >=0){
+        //LEFT wheels, Forward
+        digitalWrite(I1, HIGH);
+        digitalWrite(I2, LOW);
+    }
+    else{
+        //LEFT wheels, Reverse
+        digitalWrite(I1, LOW);
+        digitalWrite(I2, HIGH);
+    }
+    analogWrite(EA, abs(L_output));
 }

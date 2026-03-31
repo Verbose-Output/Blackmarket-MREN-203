@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
 import serial
 import serial.tools.list_ports
 import time
 
-
 class ConstantCommandNode(Node):
     def __init__(self):
         super().__init__('constant_command')
-
         self.SERIAL_PORT = '/dev/ttyACM0'
         self.BAUD_RATE = 9600
         self.ser = None
-
         self.v_cmd = 0.5
         self.w_cmd = 0.0
-
         self._connect_serial()
-
-        # Send the command repeatedly
         self.timer = self.create_timer(0.1, self.timer_callback)  # 10 Hz
-
         self.get_logger().info('Constant command node started.')
         self.get_logger().info(f'Sending v={self.v_cmd}, w={self.w_cmd}')
 
@@ -33,8 +25,24 @@ class ConstantCommandNode(Node):
                 self.BAUD_RATE,
                 timeout=1
             )
-            time.sleep(2)
-            self.get_logger().info(f'Connected to Arduino on {self.SERIAL_PORT}')
+            self.get_logger().info('Waiting for Arduino to boot...')
+            time.sleep(3)
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+
+            # Wait for Arduino to signal it is ready
+            self.get_logger().info('Waiting for Arduino ready signal...')
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    self.get_logger().info(f'Arduino says: {line}')
+                if 'ready' in line.lower():
+                    self.get_logger().info('Arduino is ready. Starting commands.')
+                    break
+            else:
+                self.get_logger().warn('Timed out waiting for Arduino ready signal. Proceeding anyway.')
+
         except serial.SerialException:
             available = [p.device for p in serial.tools.list_ports.comports()]
             self.get_logger().error(
@@ -46,9 +54,7 @@ class ConstantCommandNode(Node):
         if self.ser is None or not self.ser.is_open:
             self.get_logger().warn('Serial port not open.')
             return
-
         cmd = f"v:{self.v_cmd:.4f},w:{self.w_cmd:.4f}\n"
-
         try:
             self.ser.write(cmd.encode('utf-8'))
             self.get_logger().info(f'Sent: {cmd.strip()}')
@@ -63,14 +69,11 @@ class ConstantCommandNode(Node):
             except serial.SerialException:
                 pass
             self.ser.close()
-
         super().destroy_node()
-
 
 def main(args=None):
     rclpy.init(args=args)
     node = ConstantCommandNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -78,7 +81,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

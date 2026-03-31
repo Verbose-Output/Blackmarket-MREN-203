@@ -9,12 +9,12 @@ class ConstantCommandNode(Node):
     def __init__(self):
         super().__init__('constant_command')
         self.SERIAL_PORT = '/dev/ttyACM0'
-        self.BAUD_RATE = 9600
+        self.BAUD_RATE = 115200           # matches Arduino
         self.ser = None
         self.v_cmd = 0.5
         self.w_cmd = 0.0
         self._connect_serial()
-        self.timer = self.create_timer(0.1, self.timer_callback)  # 10 Hz
+        self.timer = self.create_timer(0.2, self.timer_callback)  # 5 Hz
         self.get_logger().info('Constant command node started.')
         self.get_logger().info(f'Sending v={self.v_cmd}, w={self.w_cmd}')
 
@@ -30,7 +30,6 @@ class ConstantCommandNode(Node):
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
 
-            # Wait for Arduino to signal it is ready
             self.get_logger().info('Waiting for Arduino ready signal...')
             deadline = time.time() + 10.0
             while time.time() < deadline:

@@ -1,101 +1,109 @@
 import cv2
 import numpy as np
 from collections import deque
+import math
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use your external camera index
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 
 if not cap.isOpened():
     print("No stream :(")
     exit()
 
-# for stable detection across frames
+# Configuration
 counter = 0
-THRESHOLD = 5  # number of consecutive frames required to detect color object
-
-# smoothing: keep last N distance values
+THRESHOLD = 5  
+CENTER_TOLERANCE = 25
+CAMERA_HEIGHT = 12.0 # cm
 distance_history = deque(maxlen=5)
 
-# HSV bounds for dull yellow
-lower_yellow = np.array([15, 80, 80])
-upper_yellow = np.array([40, 255, 255])
-
-# Polynomial coefficients from your Excel calibration
-# y = -143310*x^2 + 7754.3*x - 1.8324
-# x = 1 / pixel_width
-poly_a = -143310
-poly_b = 7754.3
-poly_c = -1.8324
+# --- HSV BOUNDS FOR PINK ---
+lower_pink = np.array([160, 60, 60])
+upper_pink = np.array([180, 255, 255])
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Failed to grab frame")
         break
 
-    # reduce noise
-    frame = cv2.GaussianBlur(frame, (5, 5), 0)
+    # Reduce noise
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-    # convert to HSV
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Create Pink Mask
+    mask = cv2.inRange(hsv, lower_pink, upper_pink)
 
-    # create mask
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    # --- MORPHOLOGY 
+    # Closing fills gaps inside the pink object to keep the box solid
+    kernel_bridge = np.ones((25, 25), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_bridge)
+    # Opening removes small random background noise
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5), np.uint8))
 
-    # clean mask
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-    # find contours
+    # Find contours
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detected = False
-    distance = None
+    direction = "NO TARGET"
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
 
-        if area > 200:  # filter small noise
+        if area > 300:  
             detected = True
             x, y, w, h = cv2.boundingRect(largest)
 
-            # draw bounding box
+            # Draw UI
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, "DETECTED", (x, y-15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+            cv2.putText(frame, "PINK TARGET", (x, y-15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # calculate distance using polynomial
+            # ----- CENTERING LOGIC -----
+            object_center_x = x + w // 2
+            frame_width = frame.shape[1]
+            frame_center_x = frame_width // 2
+
+            # Center Line
+            cv2.line(frame, (frame_center_x, 0), (frame_center_x, frame.shape[0]), (255, 0, 0), 2)
+
+            if object_center_x < frame_center_x - CENTER_TOLERANCE:
+                direction = "GO LEFT"
+            elif object_center_x > frame_center_x + CENTER_TOLERANCE:
+                direction = "GO RIGHT"
+            else:
+                direction = "CENTERED"
+
+            cv2.putText(frame, f"Action: {direction}", (20, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+            # ----- DISTANCE LOGIC (Power Regression) -----
             if w > 0:
-                inv_w = 1 / w
-                distance = poly_a * (inv_w**2) + poly_b * inv_w + poly_c
-                distance_history.append(distance)
+                inv_w = 1.0 / w
+                # Equation: y = 5289.2 * x^1.0861
+                hypotenuse = 5289.2 * (inv_w ** 1.0861)
+                distance_history.append(hypotenuse)
 
-                # smooth distance
-                smooth_distance = sum(distance_history) / len(distance_history)
+                if len(distance_history) > 0:
+                    avg_hyp = sum(distance_history) / len(distance_history)
 
-                cv2.putText(frame, f"Distance: {smooth_distance:.2f} cm", (x, y-35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    # Pythagorean theorem for Ground Distance
+                    if avg_hyp > CAMERA_HEIGHT:
+                        ground_dist = math.sqrt(avg_hyp**2 - CAMERA_HEIGHT**2)
+                    else:
+                        ground_dist = 0.0
 
-    # stability check
-    if detected:
-        counter += 1
-    else:
-        counter = 0
-        distance_history.clear()  # reset smoothing when object lost
+                    cv2.putText(frame, f"Ground Dist: {ground_dist:.2f} cm", (x, y-55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    # display status
-    if counter >= THRESHOLD:
-        cv2.putText(frame, "STATUS: YELLOW DETECTED", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-    else:
-        cv2.putText(frame, "STATUS: NOT DETECTED", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+    # Status Display
+    counter = counter + 1 if detected else 0
+    status_text = "STATUS: DETECTED" if counter >= THRESHOLD else "STATUS: SEARCHING"
+    status_color = (0, 255, 0) if counter >= THRESHOLD else (0, 0, 255)
+    cv2.putText(frame, status_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
 
-    # show windows
-    cv2.imshow("Mask", mask)
-    cv2.imshow("Detection", frame)
+    cv2.imshow("Pink Mask", mask)
+    cv2.imshow("Duck Tracker", frame)
 
-    # exit on ESC
     if cv2.waitKey(1) & 0xFF == 27:
         break
 

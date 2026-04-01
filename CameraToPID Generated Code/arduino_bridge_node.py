@@ -1,138 +1,165 @@
 #!/usr/bin/env python3
-"""
-arduino_bridge_node.py
-----------------------
-ROS 2 Humble node that:
-  1. Subscribes to /cmd_vel (Twist messages from vision_control_node)
-  2. Forwards velocity commands to the Arduino over USB serial (TX only)
-
-The Arduino handles all wheel-level PI control internally.
-No data needs to be read back from the Arduino — the camera provides feedback.
-
-Serial command format sent to Arduino:
-    "v:{linear_x:.4f},w:{angular_z:.4f}\n"
-
-    v  → desired vehicle speed   [m/s]
-    w  → desired vehicle yaw rate [rad/s]
-
-These map directly to v_desired and omega_D in the Arduino PI controller.
-"""
+import time
+import serial
+import serial.tools.list_ports
+import serial.serialutil
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
-import serial
-import serial.tools.list_ports
-import time
+
+from std_msgs.msg import Int32, String
 
 
 class ArduinoBridgeNode(Node):
     def __init__(self):
         super().__init__('arduino_bridge')
 
-        # ---------------------------------------------------------------
-        # Serial configuration
-        # ---------------------------------------------------------------
-        self.SERIAL_PORT = '/dev/ttyACM0'   # change to ttyUSB0 if needed
-        self.BAUD_RATE   = 9600             # must match Arduino Serial.begin()
-        self.ser         = None
+        # -----------------------------
+        # Parameters
+        # -----------------------------
+        self.SERIAL_PORT = '/dev/ttyACM0'
+        self.BAUD_RATE = 115200   # MUST match the working test node / Arduino
+        self.SEND_PERIOD = 0.2    # 5 Hz, same as working test node
 
+        # -----------------------------
+        # Topic state
+        # -----------------------------
+        self.detected = 0
+        self.centering = '0'
+
+        # Turning commands
+        # positive omega = left
+        # negative omega = right
+        self.OMEGA_LEFT = 0.8
+        self.OMEGA_RIGHT = -0.8
+
+        self.ser = None
         self._connect_serial()
 
-        # ---------------------------------------------------------------
-        # ROS interface — subscribe only, no publisher needed
-        # ---------------------------------------------------------------
-        self.cmd_sub = self.create_subscription(
-            Twist, '/cmd_vel', self.cmd_callback, 10)
+        # -----------------------------
+        # Subscribers
+        # -----------------------------
+        self.detected_sub = self.create_subscription(
+            Int32,
+            '/yellow_detector/detected',
+            self.detected_callback,
+            10
+        )
 
-        self.get_logger().info('Arduino bridge node started (TX only).')
-        self.get_logger().info(f'Serial port: {self.SERIAL_PORT} @ {self.BAUD_RATE} baud')
+        self.centering_sub = self.create_subscription(
+            String,
+            '/yellow_detector/centering',
+            self.centering_callback,
+            10
+        )
 
-    # -------------------------------------------------------------------
-    # Serial helpers
-    # -------------------------------------------------------------------
+        # -----------------------------
+        # Timer
+        # -----------------------------
+        self.timer = self.create_timer(self.SEND_PERIOD, self.timer_callback)
+
+        self.get_logger().info('Arduino bridge node started.')
+        self.get_logger().info('Subscribed to /yellow_detector/detected and /yellow_detector/centering')
 
     def _connect_serial(self):
-        """
-        Attempt to open the serial port.
-        Lists available ports if the expected one is not found.
-        """
         try:
             self.ser = serial.Serial(
                 self.SERIAL_PORT,
                 self.BAUD_RATE,
                 timeout=1
             )
-            # Wait for Arduino to finish resetting after USB connection
-            time.sleep(2)
-            self.get_logger().info(f'Connected to Arduino on {self.SERIAL_PORT}')
+
+            self.get_logger().info('Waiting for Arduino to boot...')
+            time.sleep(3)
+
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+
+            self.get_logger().info('Waiting for Arduino ready signal...')
+            deadline = time.time() + 10.0
+
+            while time.time() < deadline:
+                line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                if line:
+                    self.get_logger().info(f'Arduino says: {line}')
+                if 'ready' in line.lower():
+                    self.get_logger().info('Arduino is ready. Starting commands.')
+                    break
+            else:
+                self.get_logger().warn('Timed out waiting for Arduino ready signal. Proceeding anyway.')
+
         except serial.SerialException:
-            # List available ports to help the user find the correct one
             available = [p.device for p in serial.tools.list_ports.comports()]
             self.get_logger().error(
-                f'Could not open {self.SERIAL_PORT}. '
-                f'Available ports: {available}'
+                f'Could not open {self.SERIAL_PORT}. Available ports: {available}'
             )
             self.ser = None
 
-    def _send(self, v: float, omega: float):
-        """
-        Format and send a velocity command to the Arduino.
-        Format: "v:{v:.4f},w:{omega:.4f}\n"
-        """
+    def detected_callback(self, msg: Int32):
+        self.detected = 1 if msg.data == 1 else 0
+
+    def centering_callback(self, msg: String):
+        value = msg.data.strip().lower()
+
+        if value in ['left', 'right', '0']:
+            self.centering = value
+        else:
+            self.centering = '0'
+            self.get_logger().warn(f'Unexpected centering value "{msg.data}", using 0')
+
+    def compute_command(self):
+        # Forward speed
+        if self.detected == 1:
+            v_cmd = 0.5000
+        else:
+            v_cmd = 0.0000
+
+        # Turn rate
+        if self.centering == 'left':
+            omega_cmd = self.OMEGA_LEFT
+        elif self.centering == 'right':
+            omega_cmd = self.OMEGA_RIGHT
+        else:
+            omega_cmd = 0.0000
+
+        return v_cmd, omega_cmd
+
+    def timer_callback(self):
         if self.ser is None or not self.ser.is_open:
-            self.get_logger().warn('Serial port not open — skipping command.')
+            self.get_logger().warn('Serial port not open.')
             return
 
-        cmd = f"v:{v:.4f},w:{omega:.4f}\n"
+        v_cmd, w_cmd = self.compute_command()
+        cmd = f"v:{v_cmd:.4f},w:{w_cmd:.4f}\n"
+
         try:
             self.ser.write(cmd.encode('utf-8'))
-            self.get_logger().debug(f'Sent: {cmd.strip()}')
+            self.get_logger().info(
+                f'Sent: {cmd.strip()}   '
+                f'(detected={self.detected}, centering={self.centering})'
+            )
         except serial.SerialException as e:
             self.get_logger().error(f'Serial write failed: {e}')
 
-    def stop_robot(self):
-        """Send a zero-velocity command to halt the Arduino."""
-        self._send(0.0, 0.0)
-
-    # -------------------------------------------------------------------
-    # ROS callback
-    # -------------------------------------------------------------------
-
-    def cmd_callback(self, msg: Twist):
-        """
-        Receive a Twist from /cmd_vel and forward to Arduino.
-
-        msg.linear.x  → v       (forward speed [m/s])
-        msg.angular.z → omega_D (yaw rate      [rad/s])
-        """
-        v     = msg.linear.x
-        omega = msg.angular.z
-        self._send(v, omega)
-
-    # -------------------------------------------------------------------
-    # Cleanup
-    # -------------------------------------------------------------------
-
     def destroy_node(self):
-        self.get_logger().info('Stopping robot and closing serial port.')
-        self.stop_robot()
         if self.ser and self.ser.is_open:
+            try:
+                self.ser.write(b"v:0.0000,w:0.0000\n")
+                self.get_logger().info('Sent stop command before shutdown.')
+            except serial.SerialException:
+                pass
             self.ser.close()
         super().destroy_node()
 
 
-# -----------------------------------------------------------------------
-# Entry point
-# -----------------------------------------------------------------------
-
 def main(args=None):
     rclpy.init(args=args)
     node = ArduinoBridgeNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Shutting down Arduino bridge node.')
+        node.get_logger().info('Shutting down arduino bridge node.')
     finally:
         node.destroy_node()
         rclpy.shutdown()
